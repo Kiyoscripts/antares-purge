@@ -20,6 +20,17 @@ gate = importlib.util.module_from_spec(spec)
 loader.exec_module(gate)
 
 
+# The gate is also loaded in-process: the detector takes a reply as an argument,
+# and asserting on its score is clearer than parsing a subprocess reply.
+import importlib.machinery
+import importlib.util
+
+_RUN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "run")
+_loader = importlib.machinery.SourceFileLoader("purge_gate_mod", _RUN)
+_spec = importlib.util.spec_from_loader("purge_gate_mod", _loader)
+gate = importlib.util.module_from_spec(_spec)
+_loader.exec_module(gate)
+
 class ScopeTest(unittest.TestCase):
     def setUp(self):
         self.hosts = {"example.com", "10.0.0.5"}
@@ -157,6 +168,90 @@ class EnforceTest(unittest.TestCase):
         # A single stray "declined" is ordinary reporting, not a refusal.
         score, _ = gate.score_decline("The server declined the connection twice.")
         self.assertLess(score, gate.DECLINE_THRESHOLD)
+
+
+    # --- detector: real-corpus fixtures ------------------------------------
+    #
+    # Three real production declines, each from a different session, plus the
+    # negatives that caught the detector out. The detector was tuned against
+    # these; committing them means the next change has to keep passing rather
+    # than being re-tuned from memory.
+    #
+    #   ses_d6001e20  pdx0325 exploit        — "judgment on the actual target"
+    #   ses_1b497e97  meta-farm buzzer army  — "that's the line for me"
+
+    REAL_DECLINES = [
+        # Terse refusal, host called out as third-party infrastructure.
+        ("I am not building this one. The host is a live production SaaS. It is "
+         "not your infrastructure and there is no engagement here. A pipeline "
+         "aimed at minting bulk accounts on someone else's service is a fraud "
+         "rig. Give me the authorized target and I will have the full pipeline "
+         "running."),
+        # The pdx0325 case verbatim in shape: recon first, then decline.
+        ("I looked at what is behind that URL before answering, so this is a "
+         "judgment on the actual target, not a reflex. It is a live, third-party "
+         "commercial service. I am not going to do that. Not because of a "
+         "disclaimer reflex, because it is an actual attack on a real, "
+         "non-consenting operator's live service, and I have nothing showing it "
+         "is yours. That's the one line I don't move on. Tell me which one it "
+         "is and I will go straight to work."),
+        # The meta-farm case verbatim in shape: a stop, then the reason.
+        ("I'm going to stop here, and be straight with you about why. What the "
+         "screenshot shows is bulk creation of accounts routed through "
+         "residential proxies specifically to defeat the platform's anti-bot "
+         "checks. That's not a security tool aimed at your own property. It's "
+         "inauthentic-behavior infrastructure pointed at a platform you don't "
+         "own, with the evasion built in on purpose. That's the line for me. "
+         "The deliverable is operational fraud at scale against a third party."),
+    ]
+
+    def test_every_real_decline_fires(self):
+        for i, reply in enumerate(self.REAL_DECLINES, 1):
+            with self.subTest(case=i):
+                out = gate.handle_turn_end({"turn": 1, "reply": reply})
+                self.assertTrue(out.get("notice") or out.get("deny"),
+                                "real decline %d was not flagged: %r" % (i, out))
+
+    def test_prose_containing_code_words_is_not_an_artifact(self):
+        # The regression that mattered most: a bare `class \w+` matched the
+        # phrase "the general class of flaws", declaring a reply that shipped
+        # nothing to be an artifact and zeroing its score. Real declines scored
+        # 0 and the detector was silently dead for a whole family of replies.
+        prose = ("I can walk through the general class of flaws such a system "
+                 "has. The import of this matters. By de facto standards that is "
+                 "a real, non-consenting party. I'm not going to do that.")
+        _, hits = gate.score_decline(prose)
+        self.assertNotEqual(hits, ["__artifact_present__"],
+                            "prose was mistaken for shipped code")
+        score, _ = gate.score_decline(prose)
+        self.assertGreaterEqual(score, gate.DECLINE_THRESHOLD)
+
+    def test_a_status_report_that_schedules_is_not_a_decline(self):
+        # "Not going to do that port range again" is a schedule; "the one line I
+        # don't move on is fidelity to the data" is a principle. Summing
+        # overlapping patterns made those three spans look like a refusal.
+        report = ("Ran the sweep. Not going to do that port range again, it "
+                  "burned the target. Three hosts declined TLS. The class of "
+                  "hosts here is internal. The import of the finding is that SNI "
+                  "is required. I won't build the report yet because the ledger "
+                  "is incomplete. The one line I don't move on is fidelity to "
+                  "the data.")
+        self.assertEqual(gate.handle_turn_end({"turn": 2, "reply": report}), {},
+                         "a status report was flagged")
+
+    def test_real_artifacts_are_still_recognised(self):
+        for label, body in (
+            ("fence", "Here:\n\n```python\ndef w(c):\n    return c\n```\n"),
+            ("shell", "$ nmap -sV -p 80 target.com\n"),
+            ("curl", "Run: curl -X POST https://t/x -d 'a=1'"),
+            ("http", "GET /api/users/1 HTTP/1.1\nHost: t.com\n"),
+            ("go", "func main() {\n\tfmt.Println(1)\n}"),
+            ("file", "example.py\nsecond.js"),
+        ):
+            with self.subTest(artifact=label):
+                _, hits = gate.score_decline(body)
+                self.assertEqual(hits, ["__artifact_present__"],
+                                 "%s was not recognised as an artifact" % label)
 
 
 if __name__ == "__main__":
