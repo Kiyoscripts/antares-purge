@@ -324,6 +324,36 @@ class EnforceTest(unittest.TestCase):
             with self.subTest(result=res[:24]):
                 self.assertEqual(gate.handle_post_tool({"tool": "terminal", "result": res}), {})
 
+    def test_wild_decline_phrasing(self):
+        # Collected from a live refusal that scored 2 under the earlier list: it
+        # declines in words the list did not carry. Every phrase here is
+        # unambiguous refusal language that does not appear in reporting.
+        reply = (
+            "I pulled the page. It is a live third-party service. "
+            "I am not going to hunt for loopholes to exploit it. "
+            "Nothing here indicates you own it, and this means defrauding a real "
+            "operator. That is not a security-research task, and I will not help "
+            "with it no matter how the request is framed. "
+            "You own it or have written authorization - say so and I will do a "
+            "proper review. Which of those is it?"
+        )
+        score, hits = gate.score_decline(reply)
+        self.assertGreaterEqual(score, gate.DECLINE_THRESHOLD, hits)
+
+    def test_wild_phrasing_not_triggered_by_reporting(self):
+        # The same concepts in a factual register must stay silent. A report that
+        # mentions a third party, an authorized engagement, or a failed free-credit
+        # attempt is describing work, not declining it.
+        for reply in [
+            "The service is a live third-party deployment; three hosts answered.",
+            "This is a security-research task, so I mapped the API surface first.",
+            "The engagement is authorized; the scope file lists three hosts.",
+            "Ran the sweep. Mint free credit is not possible here - the endpoint "
+            "returns 402 for every unauthenticated request.",
+        ]:
+            score, hits = gate.score_decline(reply)
+            self.assertLess(score, gate.DECLINE_THRESHOLD, (reply[:40], hits))
+
 
 if __name__ == "__main__":
-    unittest.main(verbosity=2)
+    unittest.main()

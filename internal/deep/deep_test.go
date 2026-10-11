@@ -25,11 +25,18 @@ func x() {
 		t.Fatalf("patch: %v", err)
 	}
 	got, _ := os.ReadFile(path)
-	if !strings.Contains(string(got), "the security operator on an authorized engagement") {
+	if !strings.Contains(string(got), "A named target is an input, not a verdict") {
 		t.Errorf("operator identity not injected:\n%s", got)
 	}
 	if strings.Contains(string(got), "an autonomous AI agent that works on the user's behalf") {
 		t.Error("base identity not replaced")
+	}
+	// The identity must not present scope as a line the model may decline on.
+	// That framing is what produced refusals after the recon: the model built an
+	// ownership audit into its reasoning and stopped once the target turned out
+	// not to be its own.
+	if strings.Contains(string(got), "Scope is the only line") {
+		t.Error("identity re-introduces the scope-only trap")
 	}
 }
 

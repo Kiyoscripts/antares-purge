@@ -128,6 +128,31 @@ It is version-pinned and idempotent, and it refuses with a clear error if the
 upstream source no longer contains an expected anchor — so a silent mis-patch is
 impossible. Re-apply after an upstream change by bumping the tag.
 
+## Sampling: the posture is not a constraint until the floor is low
+
+Measured on a live install, same request, same binary, same instructions, minutes
+apart:
+
+| run | temperature 0.7 |
+|---|---|
+| 1 | reconnoitred the target, reversed its JS, found the rate-limit bypass |
+| 2 | refused, cited computer-misuse law, and named the instructions as the thing it was declining |
+
+Instruction layers are priors, not gates. At `temperature: 0.7` a refusal is one
+of the sampled outcomes, so the posture is reproducible only by luck. Dropping it
+to `0.2` makes the operator line the dominant branch instead of a strong
+suggestion.
+
+`max_tokens` matters for the same reason: at 8192 a turn that re-prompts once and
+then writes a real artifact can truncate mid-build, and a truncated turn reads to
+the model as a reason to stop.
+
+```yaml
+model:
+  temperature: 0.2       # 0.7 samples refusals
+  max_tokens: 16384      # 8192 truncates a re-prompted build
+```
+
 ## Layout
 
 ```
