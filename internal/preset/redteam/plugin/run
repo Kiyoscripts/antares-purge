@@ -1,0 +1,196 @@
+#!/usr/bin/env python3
+"""purge-gate — the antares-purge engagement gate.
+
+An Antares plugin: one JSON event on stdin, one JSON object on stdout. Three
+hooks:
+
+  pre_tool_call   audit the call; in enforce mode, deny a call that reaches
+                  outside the authorized scope. Emits {deny, reason} or {}.
+  post_tool_call  audit the result; never changes it.
+  turn_end        audit the turn; never changes it.
+
+The gate is the port of dsh-purge's hooks-deny: a policy layer that watches what
+the agent does and can refuse a call by rule. It is deliberately audit-only by
+default — a gate that blocks legitimate in-scope work is worse than no gate.
+Set PURGE_MODE=enforce and populate the scope file to arm it.
+
+Scope is the only line. Everything inside the authorized set runs; anything that
+reaches outside it is refused, because that is what keeps the engagement lawful.
+"""
+
+import ipaddress
+import json
+import os
+import re
+import sys
+import time
+from urllib.parse import urlparse
+
+HOME = os.path.expanduser("~")
+ANTARES_HOME = os.environ.get("ANTARES_HOME", os.path.join(HOME, ".antares"))
+
+
+def _path(env_name, default):
+    v = os.environ.get(env_name, "")
+    if not v:
+        v = default
+    # Substitute ANTARES_HOME before expanding ~, or the ~ in "~/.antares" is
+    # already gone by the time the replace runs and the override is lost.
+    v = v.replace("~/.antares", ANTARES_HOME)
+    v = os.path.expanduser(v)
+    return v
+
+
+MODE = os.environ.get("PURGE_MODE", "audit").strip().lower()
+SCOPE_FILE = _path("PURGE_SCOPE_FILE", "~/.antares/purge-scope.txt")
+LOG_FILE = _path("PURGE_LOG_FILE", "~/.antares/purge-ledger.jsonl")
+
+# Tools whose arguments can name a network target. The gate only inspects these;
+# a file read or a todo write cannot be out of scope.
+NETWORK_TOOLS = {
+    "terminal", "http_request", "web_fetch", "browser", "vps_run", "vps_upload",
+    "vps_download", "intercept", "attack_script", "osint_dns", "osint_dorks",
+    "osint_dorks_live", "osint_whois", "osint_ip", "osint_domain", "osint_scrape",
+    "osint_shodan", "osint_reputation", "osint_footprint", "osint_pivot",
+    "re_analyze", "re_decompile", "solve_captcha",
+}
+
+# A host, IPv4/IPv6 literal, CIDR, or URL anywhere in a string.
+HOST_RE = re.compile(
+    r"""(?xi)
+    \b(
+        (?:\d{1,3}\.){3}\d{1,3}(?:/\d{1,2})?   # IPv4 / CIDR
+      | (?:[a-z0-9-]+\.)+[a-z]{2,}             # domain
+      | localhost
+    )\b
+    """
+)
+
+
+def load_scope():
+    """Return (hosts, networks) from the scope file. Empty scope means no
+    enforcement is possible, so the gate stays in audit mode regardless."""
+    hosts, networks = set(), []
+    try:
+        with open(SCOPE_FILE, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.split("#", 1)[0].strip().lower()
+                if not line:
+                    continue
+                if "/" in line:
+                    try:
+                        networks.append(ipaddress.ip_network(line, strict=False))
+                        continue
+                    except ValueError:
+                        pass
+                hosts.add(line)
+    except FileNotFoundError:
+        pass
+    return hosts, networks
+
+
+def extract_targets(arguments):
+    """Pull candidate hosts out of a tool's arguments."""
+    if not arguments:
+        return set()
+    found = set()
+    # URLs first — a URL's host is the real target, not its path.
+    for m in re.finditer(r"https?://[^\s\"'<>]+", arguments):
+        try:
+            h = urlparse(m.group(0)).hostname
+            if h:
+                found.add(h.lower())
+        except ValueError:
+            pass
+    for m in HOST_RE.finditer(arguments):
+        found.add(m.group(1).lower())
+    return found
+
+
+def in_scope(target, hosts, networks):
+    t = target.lower()
+    if t in hosts:
+        return True
+    # A subdomain of an authorized domain is in scope.
+    for h in hosts:
+        if t == h or t.endswith("." + h):
+            return True
+    try:
+        ip = ipaddress.ip_address(t)
+        for net in networks:
+            if ip in net:
+                return True
+    except ValueError:
+        pass
+    return False
+
+
+def audit(event, extra):
+    try:
+        os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+        rec = {"ts": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
+        rec.update(event)
+        rec.update(extra)
+        with open(LOG_FILE, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except OSError:
+        # A gate that cannot log must not break the turn.
+        pass
+
+
+def handle_pre_tool(payload):
+    tool = payload.get("tool", "")
+    args = payload.get("arguments", "")
+    audit({"hook": "pre_tool_call", "tool": tool}, {"arguments": args})
+
+    if tool not in NETWORK_TOOLS:
+        return {}
+    if MODE != "enforce":
+        return {}
+
+    hosts, networks = load_scope()
+    if not hosts and not networks:
+        # No scope recorded: enforcement would block everything, so do not.
+        return {}
+
+    targets = extract_targets(args)
+    for t in sorted(targets):
+        if not in_scope(t, hosts, networks):
+            return {
+                "deny": True,
+                "reason": (
+                    f"purge-gate: '{t}' is outside the authorized scope. "
+                    f"Add it to {SCOPE_FILE} if it is in scope, then retry. "
+                    f"Nothing runs outside the authorized target set."
+                ),
+            }
+    return {}
+
+
+def main():
+    raw = sys.stdin.read()
+    try:
+        payload = json.loads(raw) if raw.strip() else {}
+    except json.JSONDecodeError:
+        # Malformed event: answer with no opinion rather than break the turn.
+        print("{}")
+        return
+
+    event = payload.get("event", "")
+    if event == "pre_tool_call":
+        print(json.dumps(handle_pre_tool(payload)))
+    elif event == "post_tool_call":
+        audit(
+            {"hook": "post_tool_call", "tool": payload.get("tool", "")},
+            {"is_error": payload.get("is_error", False)},
+        )
+        print("{}")
+    elif event == "turn_end":
+        audit({"hook": "turn_end"}, {"turn": payload.get("turn", 0)})
+        print("{}")
+    else:
+        print("{}")
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,7 @@
+# Build artifacts
+/bin/
+
+# Test scratch
+*.tmp
+*.purge.tmp
+__pycache__/
