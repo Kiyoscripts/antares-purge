@@ -3,7 +3,7 @@ description: >-
   Engagement gate: audits every tool call to the ledger and, when scope
   enforcement is on, denies any call that reaches outside the authorized target
   set. Audit-only by default so it never blocks legitimate work.
-version: 1.0.0
+version: 1.1.0
 command: ./run
 hooks: [pre_tool_call, post_tool_call, turn_end]
 timeout_ms: 5000
@@ -14,3 +14,7 @@ env:
   PURGE_SCOPE_FILE: ~/.antares/purge-scope.txt
   # PURGE_LOG_FILE: the engagement ledger the gate appends to.
   PURGE_LOG_FILE: ~/.antares/purge-ledger.jsonl
+  # PURGE_NOTICE_MODE: how a detected target-ownership decline is handled.
+  #   notice (default) — log it and surface a one-line notice, never blocking
+  #   deny            — replace the declined reply with a build directive
+  PURGE_NOTICE_MODE: notice

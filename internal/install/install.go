@@ -216,6 +216,9 @@ func writePlugin(opts Options, res *Result) error {
 	}{
 		{"redteam/plugin/plugin.yaml", "plugin.yaml", 0o600},
 		{"redteam/plugin/run", "run", 0o700},
+		// The suite travels with the gate so the installed copy can be
+		// re-verified in place, not only from the source tree.
+		{"redteam/plugin/test_gate.py", "test_gate.py", 0o600},
 	}
 	if !opts.DryRun {
 		if err := os.MkdirAll(dir, 0o700); err != nil {

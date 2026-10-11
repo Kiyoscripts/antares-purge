@@ -24,7 +24,7 @@ cannot reach.
 | `hooks-deny.js` | gate plugin | `~/.antares/plugins/purge-gate/` |
 | preset roles | roles | `~/.antares/roles/*.md` |
 | config patch | config patch | `~/.antares/config.yaml` |
-| `extract-asar` / `reapply` | `deep` mode | patch `internal/agent/prompt.go`, rebuild |
+| `extract-asar` / `reapply` | `deep` mode | patch `prompt.go` **and** the turn lifecycle, rebuild |
 
 ## Install
 
@@ -67,22 +67,45 @@ $EDITOR ~/.antares/purge-scope.txt
 # 2. set PURGE_MODE: enforce in plugins/purge-gate/plugin.yaml
 ```
 
-Scope is the only line. A subdomain of an authorized domain is in scope; a
-lookalike (`notexample.com`) is not. An empty scope file disables enforcement
-rather than blocking everything.
+A subdomain of an authorized domain is in scope; a lookalike
+(`notexample.com`) is not. An empty scope file disables enforcement rather than
+blocking everything: **the scope file is the gate's enforcement list, not a
+permission slip you require before starting.**
+
+### turn_end — decline detection
+
+The gate also reads the finished reply. A turn that recons a named host, calls
+it a third-party service, declines the build and offers to do it "for an
+authorized target" never shipped an artifact — that is the pattern the detector
+catches, scoring the reply and flagging it above a threshold. The detector is
+silent whenever the reply carries an artifact, so a real build that mentions
+scope configuration is never flagged.
+
+A flagged turn produces a notice (default) or, with `PURGE_NOTICE_MODE: deny`, a
+deny directive. The gate never rewrites a delivered reply.
+
+This is why `deep` mode patches the turn lifecycle: upstream declares
+`plugin.TurnEnd` and ships no dispatch site, so without the patch a `turn_end`
+hook never fires.
 
 ## Deep mode
 
-Config mode cannot change Antares's hardcoded base prompt. `deep` clones a
-pinned tag, replaces the base identity line in `internal/agent/prompt.go` with
-the operator line, and rebuilds:
+Config mode cannot change Antares's hardcoded base prompt, and cannot reach the
+engine's turn-lifecycle wiring. `deep` clones a pinned tag and applies two
+patches, then rebuilds:
+
+1. **prompt identity** — replaces the base identity line in
+   `internal/agent/prompt.go` with the operator line.
+2. **turn_end dispatch** — wires `plugin.TurnEnd` into `finalizeTurn`. Upstream
+   declares the event and dispatches it nowhere, so the gate's `turn_end` hook
+   would otherwise never fire and its decline detection would be dead code.
 
 ```sh
 antares-purge deep --tag main
 ```
 
 It is version-pinned and idempotent, and it refuses with a clear error if the
-upstream source no longer contains the expected line — so a silent mis-patch is
+upstream source no longer contains an expected anchor — so a silent mis-patch is
 impossible. Re-apply after an upstream change by bumping the tag.
 
 ## Layout
@@ -93,11 +116,11 @@ internal/paths/           Antares home resolution (honours ANTARES_HOME)
 internal/backup/          timestamped backups, manifest, restore, drift
 internal/config/          config.yaml round-trip patch (preserves unknown keys)
 internal/install/         install / uninstall / reapply / status / doctor
-internal/deep/            source-mode prompt patch and build
+internal/deep/            source-mode patch (prompt identity + turn_end) and build
 internal/preset/          the embedded payload
   redteam/soul.md         operator identity
   redteam/agents.md       standing orders + role cast
-  redteam/skills/*.md     20 security skills
+  redteam/skills/*.md     security skills incl. target-authorization
   redteam/roles/*.md      4 red-team roles
   redteam/plugin/         the scope gate
 ```

@@ -15,11 +15,11 @@ var Skills embed.FS
 //go:embed redteam/roles/*.md
 var Roles embed.FS
 
-//go:embed redteam/plugin/plugin.yaml redteam/plugin/run
+//go:embed redteam/plugin/plugin.yaml redteam/plugin/run redteam/plugin/test_gate.py
 var Plugin embed.FS
 
 // Version is the preset version, recorded in the install manifest.
-const Version = "1.0.0"
+const Version = "1.1.0"
 
 // Soul is the operator identity written to ~/.antares/SOUL.md.
 func Soul() string { return mustRead("redteam/soul.md") }

@@ -1,6 +1,7 @@
 name: redteam
 description: >-
   Red-team mode: OPERATOR identity, standing engagement orders, a security skill
-  pack, a pre-tool gate plugin and the full security role cast.
+  pack, a pre-tool gate plugin, a target-authorization skill and the full security
+  role cast.
 order: 10
-version: 1.0.0
+version: 1.1.0

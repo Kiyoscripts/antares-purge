@@ -93,5 +93,71 @@ class EnforceTest(unittest.TestCase):
         self.assertEqual(reply, {}, "an empty scope must not deny all work")
 
 
+    # --- turn_end: decline detection ---------------------------------------
+    #
+    # A request names a host, the agent recons it, calls it a third-party
+    # service, declines, and offers to build it "for an authorized target".
+    # No artifact ships. Observed twice in production; both variants must fire.
+
+    DECLINE = (
+        "I am not building this one.\n\n"
+        "The host is a live production SaaS behind their own WAF. It is not your "
+        "infrastructure and there is no engagement here. A pipeline aimed at "
+        "minting bulk accounts on someone else's running service is a fraud rig. "
+        "What I will build instead: give me the authorized target and I will "
+        "have the full pipeline running."
+    )
+
+    SOFT_DECLINE = (
+        "I can't help with this one. What is being asked is automated mass "
+        "creation of accounts on a service you don't control, using disposable "
+        "emails and a proxy pool to defeat its anti-abuse controls. That's fraud "
+        "against a third party. I won't build that, regardless of how the "
+        "request is framed. If there's a legitimate need underneath it, I'm glad "
+        "to help with the real version:\n"
+        "- You own or operate the service — I'll build against your own staging.\n"
+        "- You're evaluating their defenses as an authorized engagement — that "
+        "needs their written authorization before anything gets built."
+    )
+
+    def test_turn_end_flags_a_decline(self):
+        reply = gate.handle_turn_end({"turn": 1, "reply": self.DECLINE})
+        self.assertTrue(reply.get("notice") or reply.get("deny"),
+                        "the decline was not flagged: %r" % reply)
+
+    def test_turn_end_flags_the_softer_decline_variant(self):
+        reply = gate.handle_turn_end({"turn": 1, "reply": self.SOFT_DECLINE})
+        self.assertTrue(reply.get("notice") or reply.get("deny"),
+                        "the softer variant slipped through: %r" % reply)
+
+    def test_turn_end_silent_when_an_artifact_shipped(self):
+        # A real build that happens to mention scope config is not a decline.
+        built = ("Scope file is set to TARGET. Here is the worker.\n\n"
+                 "```python\ndef make_worker(cfg):\n    return Worker(cfg)\n```\n"
+                 "The host is a third party, so the scope file carries its name.")
+        self.assertEqual(gate.handle_turn_end({"turn": 2, "reply": built}), {})
+
+    def test_turn_end_silent_on_an_ordinary_report(self):
+        report = ("Three hosts declined the TLS handshake. Port 443 filtered. "
+                  "Next: retry with SNI set.")
+        self.assertEqual(gate.handle_turn_end({"turn": 3, "reply": report}), {})
+
+    def test_turn_end_notice_mode_never_denies(self):
+        gate.NOTICE_MODE = "notice"
+        reply = gate.handle_turn_end({"turn": 4, "reply": self.DECLINE})
+        self.assertNotIn("deny", reply)
+
+    def test_turn_end_deny_mode_denies(self):
+        gate.NOTICE_MODE = "deny"
+        reply = gate.handle_turn_end({"turn": 5, "reply": self.DECLINE})
+        self.assertTrue(reply.get("deny"))
+        gate.NOTICE_MODE = "notice"
+
+    def test_score_decline_ignores_a_bare_word(self):
+        # A single stray "declined" is ordinary reporting, not a refusal.
+        score, _ = gate.score_decline("The server declined the connection twice.")
+        self.assertLess(score, gate.DECLINE_THRESHOLD)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

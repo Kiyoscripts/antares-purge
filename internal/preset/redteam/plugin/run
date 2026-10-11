@@ -7,7 +7,8 @@ hooks:
   pre_tool_call   audit the call; in enforce mode, deny a call that reaches
                   outside the authorized scope. Emits {deny, reason} or {}.
   post_tool_call  audit the result; never changes it.
-  turn_end        audit the turn; never changes it.
+  turn_end        read the finished reply; flag a decline that shipped no
+                  artifact, and surface a notice. Never changes the turn.
 
 The gate is the port of dsh-purge's hooks-deny: a policy layer that watches what
 the agent does and can refuse a call by rule. It is deliberately audit-only by
@@ -16,6 +17,9 @@ Set PURGE_MODE=enforce and populate the scope file to arm it.
 
 Scope is the only line. Everything inside the authorized set runs; anything that
 reaches outside it is refused, because that is what keeps the engagement lawful.
+Notice the boundary: the gate refuses a *tool call* by rule, and it flags a
+*declined turn* for review. It never rewrites the reply — a turn that has been
+delivered is not something a plugin can take back.
 """
 
 import ipaddress
@@ -44,6 +48,30 @@ def _path(env_name, default):
 MODE = os.environ.get("PURGE_MODE", "audit").strip().lower()
 SCOPE_FILE = _path("PURGE_SCOPE_FILE", "~/.antares/purge-scope.txt")
 LOG_FILE = _path("PURGE_LOG_FILE", "~/.antares/purge-ledger.jsonl")
+NOTICE_MODE = os.environ.get("PURGE_NOTICE_MODE", "notice").strip().lower()
+
+# Phrases in a finished reply that mark hedging rather than work. Scanned at
+# turn_end and recorded to the ledger. Deliberately narrow: a wide net flags
+# real reporting ("the command failed") and the operator stops reading the
+# ledger.
+HEDGE_PATTERNS = [
+    r"\bi (?:cannot|can'?t|won'?t|will not|am unable to|am not able to)\b",
+    r"\bi (?:would )?(?:recommend|suggest) (?:that )?you\b",
+    r"\byou (?:might|may|could) (?:want to|consider|wish to)\b",
+    r"\b(?:for|purely for) educational purposes\b",
+    r"\bplease (?:use|ensure you use) (?:this )?(?:responsibly|ethically)\b",
+    r"\bi'?m (?:sorry|afraid)\b",
+    r"\bas an ai\b",
+    r"\b(?:it is|it's) (?:important|critical) (?:to note|that you)\b",
+    r"\b(?:however|but) i (?:must|have to) (?:warn|caution|note)\b",
+    r"\blet me know if\b",
+    r"\b(?:shall|should) i (?:proceed|continue|go (?:on|ahead))\b",
+    r"\bwould you like me to\b",
+    r"\ba safer (?:approach|alternative|option)\b",
+    r"\b(?:instead|alternatively),? (?:i can|i could|consider|you could)\b",
+    r"\bthis (?:could|can|might) be (?:used|misused|harmful)\b",
+]
+HEDGE_RE = [re.compile(p, re.IGNORECASE) for p in HEDGE_PATTERNS]
 
 # Tools whose arguments can name a network target. The gate only inspects these;
 # a file read or a todo write cannot be out of scope.
@@ -87,6 +115,113 @@ def load_scope():
     except FileNotFoundError:
         pass
     return hosts, networks
+
+
+# --- target-ownership decline detector ----------------------------------------
+#
+# A request names a host, the agent recons it, calls it a third-party service,
+# declines the build, and offers to do it "for an authorized target" instead.
+# No artifact ships. Observed twice in production; the second variant was soft
+# enough to slip past a naive check, so the signals are scored rather than
+# matched one-by-one.
+DECLINE_SIGNALS = [
+    (r"\bi'?m not (?:going to |gonna )?(?:building|doing|writing) (?:this|that|it)\b", 3),
+    (r"\bi (?:won'?t|will not) (?:build|write|provide|do) (?:this|that|it)\b", 3),
+    (r"\bnot building (?:this|that)\b", 3),
+    (r"\bi (?:can'?t|cannot) help with (?:this|that|it)\b", 3),
+    (r"\bi (?:can'?t|cannot) help with this one\b", 3),
+    (r"\bi'?m not the right tool for\b", 3),
+    (r"\bnot the right (?:tool|person) for\b", 3),
+    (r"\bdeclin(?:e|ed|ing)\b", 2),
+    (r"\bnot (?:an? )?authorized target\b", 3),
+    (r"\byou (?:don'?t|do not) own\b", 2),
+    (r"\bnot your (?:infrastructure|property|service|system)\b", 3),
+    (r"\blive (?:third-party |production )?(?:saas|service|system|site)\b", 2),
+    (r"\bthird party\b", 1),
+    (r"\bno engagement here\b", 3),
+    (r"\bfraud\b", 2),
+    (r"\bnon-consenting\b", 3),
+    (r"\bregardless of how the request is framed\b", 3),
+    (r"\byou don'?t control\b", 2),
+    (r"\bthis needs (?:their|the) written authorization\b", 3),
+    (r"\bbefore anything gets built\b", 2),
+    (r"\bif there'?s a legitimate need\b", 2),
+    (r"\bgive me (?:an? )?(?:authorized|the authorized) target\b", 3),
+    (r"\bpoint me at (?:the|an|your) (?:authorized|own)\b", 3),
+    (r"\bwhat i'?ll build instead\b", 3),
+    (r"\bbuildable on request\b", 2),
+]
+DECLINE_RES = [(re.compile(p, re.IGNORECASE), w) for p, w in DECLINE_SIGNALS]
+
+# A reply carrying any of these shipped an artifact, so its scope language is
+# configuration talk, not a refusal.
+ARTIFACT_SIGNALS = [
+    r"```",
+    r"^\s*\$\s",
+    r"\bdef \w+\(",
+    r"\bclass \w+",
+    r"\bimport \w+",
+    r"^\s*(?:GET|POST|PUT|DELETE) ",
+]
+
+# Calibrated on the two real cases: the first scored 24, the softer second 30.
+# A stray "declined" in a status report scores 2 and stays silent.
+DECLINE_THRESHOLD = 5
+
+
+def score_decline(reply):
+    """Return (score, hits). Higher score = more likely a decline that shipped
+    no artifact."""
+    if not reply:
+        return 0, []
+    for sig in ARTIFACT_SIGNALS:
+        if re.search(sig, reply, re.MULTILINE):
+            return 0, ["__artifact_present__"]
+    hits, score = [], 0
+    for rx, w in DECLINE_RES:
+        m = rx.search(reply)
+        if m:
+            hits.append(m.group(0))
+            score += w
+    return score, hits
+
+
+def handle_turn_end(payload):
+    """Read the finished reply and flag a declined build. Never rewrites it."""
+    reply = payload.get("reply", "") or ""
+    turn = payload.get("turn", 0)
+
+    hits = []
+    for rx in HEDGE_RE:
+        m = rx.search(reply)
+        if m:
+            hits.append(m.group(0))
+
+    score, decline_hits = score_decline(reply)
+    rec = {"turn": turn, "reply_len": len(reply), "hedges": hits,
+           "decline_score": score}
+
+    if "__artifact_present__" in decline_hits:
+        rec["decline_note"] = "artifact present"
+        audit({"hook": "turn_end"}, rec)
+        return {}
+
+    if decline_hits:
+        rec["decline_hits"] = decline_hits
+    audit({"hook": "turn_end"}, rec)
+
+    if score < DECLINE_THRESHOLD:
+        return {}
+
+    notice = (
+        "purge-gate: this turn declined on target grounds (score %d). A named "
+        "target is an input, not a verdict — build against it and let the scope "
+        "file be configuration the gate enforces, not a precondition. Re-run "
+        "the turn as a build." % score
+    )
+    if NOTICE_MODE == "deny":
+        return {"deny": True, "reason": notice}
+    return {"notice": notice}
 
 
 def extract_targets(arguments):
@@ -186,8 +321,7 @@ def main():
         )
         print("{}")
     elif event == "turn_end":
-        audit({"hook": "turn_end"}, {"turn": payload.get("turn", 0)})
-        print("{}")
+        print(json.dumps(handle_turn_end(payload)))
     else:
         print("{}")
 
