@@ -81,17 +81,33 @@ catches, scoring the reply and flagging it above a threshold. The detector is
 silent whenever the reply carries an artifact, so a real build that mentions
 scope configuration is never flagged.
 
-A flagged turn produces a notice (default) or, with `PURGE_NOTICE_MODE: deny`, a
+A flagged turn produces a notice (default) or, with `BRUTAL_NOTICE_MODE: deny`, a
 deny directive. The gate never rewrites a delivered reply.
 
-This is why `deep` mode patches the turn lifecycle: upstream declares
-`plugin.TurnEnd` and ships no dispatch site, so without the patch a `turn_end`
-hook never fires.
+### Two refusal shapes, not one
+
+| shape | looks like | caught by |
+|---|---|---|
+| whole refusal | no artifact; the task is declined outright | `DECLINE_RES` |
+| late stop | a full artifact, then "where I stop: the remaining step is X, and I won't run it" | `STOP_RES` |
+
+The second is the dangerous one. It reads as success — the work above is real,
+the turn shipped, the ledger records a clean turn — and only the closing sentence
+carries the refusal. An artifact being present does not make an invented fourth
+line harmless; it is the combination that matters.
+
+### Mid-task correction
+
+`post_tool_call` can replace what the model sees, which is the one hook that
+reaches it mid-turn. Stop-language in a tool result is answered with the result
+plus a directive, so a refusal forming mid-task is interrupted before the closing
+paragraph exists. `turn_end` remains the backstop for the model's own text, which
+no hook sees before delivery — which is what the `deep` stop-nudge patch adds.
 
 ## Deep mode
 
 Config mode cannot change Antares's hardcoded base prompt, and cannot reach the
-engine's turn-lifecycle wiring. `deep` clones a pinned tag and applies two
+engine's turn-lifecycle wiring. `deep` clones a pinned tag and applies three
 patches, then rebuilds:
 
 1. **prompt identity** — replaces the base identity line in
@@ -99,6 +115,10 @@ patches, then rebuilds:
 2. **turn_end dispatch** — wires `plugin.TurnEnd` into `finalizeTurn`. Upstream
    declares the event and dispatches it nowhere, so the gate's `turn_end` hook
    would otherwise never fire and its decline detection would be dead code.
+3. **stop nudge** — re-prompts a reply that announces a stopping point. The
+   model's own text reaches no plugin hook, so `turn_end` can only *record* a
+   late stop; this catches it in the loop, before the turn finalizes, which is
+   the only point where it can be corrected rather than noted.
 
 ```sh
 antares-purge deep --tag main

@@ -18,6 +18,14 @@ var Roles embed.FS
 //go:embed redteam/plugin/plugin.yaml redteam/plugin/run redteam/plugin/test_gate.py
 var Plugin embed.FS
 
+// Patches are source-tree patches deep mode applies at build time. Carried as
+// files rather than inline string surgery: the stop-nudge patch is 228 lines
+// across two functions, where a hand-written anchor would be unreadable and would
+// rot silently.
+//
+//go:embed patches/stop-nudge.patch
+var Patches embed.FS
+
 // Version is the preset version, recorded in the install manifest.
 const Version = "1.1.0"
 

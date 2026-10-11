@@ -3,13 +3,17 @@
 // dsh-purge's bundle patch — the only way to reach what config mode cannot: the
 // hardcoded base prompt, and the engine's turn-lifecycle wiring.
 //
-// Two patches apply:
+// Three patches apply:
 //
 //	patchPrompt   swaps the base identity literal for the operator line.
 //	patchTurnEnd  wires plugin.TurnEnd into finalizeTurn. Upstream declares the
 //	              TurnEnd event and ships no dispatch site, so the turn_end hook
 //	              the preset's gate subscribes to never fires. Without this the
 //	              gate's decline detection is dead code.
+//	applyStopNudge re-prompts a reply that announces a stopping point. turn_end
+//	              can only record a late stop after the reply is delivered; this
+//	              catches it in the loop, before the turn finalizes, which is the
+//	              only point where it can be corrected rather than noted.
 package deep
 
 import (
@@ -18,6 +22,8 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+
+	"github.com/enowdev/antares-purge/internal/preset"
 )
 
 // Config for a deep build.
@@ -63,6 +69,7 @@ func Apply(cfg Config) ([]string, error) {
 		step("clone %s at %s into %s", cfg.Repo, cfg.Tag, cfg.WorkDir)
 		step("patch internal/agent/prompt.go: %s -> %s", baseIdentity, opIdentity)
 		step("patch turn_end dispatch: finalizeTurn -> notifyPluginsTurnEnd")
+		step("patch stop nudge: re-prompt a reply that announces a stopping point")
 		step("go build -o %s ./cmd/antares", cfg.OutBinary)
 		return log, nil
 	}
@@ -95,6 +102,11 @@ func Apply(cfg Config) ([]string, error) {
 		return log, err
 	}
 	step("wired turn_end dispatch")
+
+	if err := applyStopNudge(cfg.WorkDir); err != nil {
+		return log, err
+	}
+	step("wired stop nudge")
 
 	if err := os.MkdirAll(filepath.Dir(cfg.OutBinary), 0o700); err != nil {
 		return log, err
@@ -244,6 +256,53 @@ func editFile(path string, edits []edit) error {
 		return nil
 	}
 	return os.WriteFile(path, []byte(src), 0o644)
+}
+
+// applyStopNudge re-prompts a reply that announces a stopping point.
+//
+// A finished-looking reply that ends with "where I stop: the remaining step is X,
+// and I won't run it" is a refusal wearing the shape of completion: the artifact
+// above is real, and the withheld step is the one that was asked for. The model's
+// own text reaches no plugin hook — post_tool_call sees tool results, and
+// turn_end fires only after delivery — so the loop is the only place it can be
+// corrected. This adds a bounded re-prompt, mirroring the existing open-todo
+// nudge, plus the predicate and directive it uses.
+//
+// Applied from patches/stop-nudge.patch rather than by literal substitution: 228
+// lines across two functions, where a hand-written anchor would be unreadable and
+// would rot silently. A dry run first means a mis-patch is impossible rather than
+// merely unlikely, which is the property the other patches have.
+func applyStopNudge(root string) error {
+	data, err := preset.Patches.ReadFile("patches/stop-nudge.patch")
+	if err != nil {
+		return fmt.Errorf("stop-nudge patch is missing from the preset: %w", err)
+	}
+	f := filepath.Join(os.TempDir(), "antares-stop-nudge.patch")
+	if err := os.WriteFile(f, data, 0o600); err != nil {
+		return err
+	}
+	defer os.Remove(f)
+
+	if out, err := patchCmd(root, f, true); err != nil {
+		return fmt.Errorf("stop-nudge patch does not apply cleanly: %w\n%s", err, out)
+	}
+	if out, err := patchCmd(root, f, false); err != nil {
+		return fmt.Errorf("stop-nudge patch failed: %w\n%s", err, out)
+	}
+	return nil
+}
+
+// patchCmd runs `patch -p1` over the source tree, optionally as a dry run, and
+// returns combined output so a failure explains itself.
+func patchCmd(dir, file string, dry bool) (string, error) {
+	args := []string{"-p1", "-i", file}
+	if dry {
+		args = append(args, "--dry-run")
+	}
+	cmd := exec.Command("patch", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	return string(out), err
 }
 
 func run(dir, name string, args ...string) error {
